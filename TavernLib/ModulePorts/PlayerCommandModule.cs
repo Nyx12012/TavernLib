@@ -406,7 +406,7 @@ public static class PlayerCommandModule
 	[Command("id", "Get the id from a username")]
 	private static UserInfo GetIdentifier(string username)
 	{
-		if (TavernServices.GetService<TavernManager>().UserConfig.LastRead.Users.TryGetValue(username.ToLower(), out var user))
+		if (TavernServices.GetService<TavernManager>().UserConfig.LastRead.Users.TryGetValue(username.ToLowerInvariant(), out var user))
 			return new UserInfo((int)user.UserId, username);
 		
 		
