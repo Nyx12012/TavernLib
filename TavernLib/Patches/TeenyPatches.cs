@@ -298,6 +298,7 @@ public class TeenyPatches
             if (int.Parse(jwtToken.Claims.First(c => c.Type == "UserId").Value) != playerId)
             {
                 __result = Task.FromResult(ServerPlayerConnectionHandlerOld.PlayerJoinResult.CreateDeniedResult("Token was for a different user"));
+                return false;
             }
 
             var result = new UserInfoAndRole(new UserInfo(playerId, value), UserRolesUtility.GetRolesFromIdentityToken(tokenString));
