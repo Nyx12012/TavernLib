@@ -18,6 +18,15 @@ internal class AuthManager
     private TavernManager _manager;
     private TcpListener _listener;
 
+    // Every read-modify-write of Users.json goes through this. Static because the
+    // file is shared even if something ever constructs a second manager.
+    private static readonly object UsersFileLock = new();
+
+    // Same idea for whitelist_requests.json. Seperate lock, seperate files
+    // So a whitelist application never blocks a join.
+    private static readonly object WhitelistRequestsFileLock = new();
+
+    private const ulong BaseUserID = 1000000000UL;
 
     public AuthManager(TavernManager manager)
     {
@@ -80,14 +89,14 @@ internal class AuthManager
     {
         TavernLogger.Msg($"Connected to TcpClient ({(client.Client.RemoteEndPoint as IPEndPoint)?.Address}), interpreting stream");
 
-        using var stream = client.GetStream();
-        using var timeout = new CancellationTokenSource();
-        timeout.CancelAfter(TimeSpan.FromSeconds(5));
-
-        var payload = await ReadFullPayload(stream, timeout.Token);
-
         try
         {
+            using var stream = client.GetStream();
+            using var timeout = new CancellationTokenSource();
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+
+            var payload = await ReadFullPayload(stream, timeout.Token);
+
             TavernLogger.Msg("Finding payload type");
 
             var jsonPayload = JObject.Parse(payload);
@@ -100,6 +109,10 @@ internal class AuthManager
                 TavernLogger.Warn($"Unknown payload sent to AuthManager {jsonPayload}");
             }
         }
+        catch (OperationCanceledException)
+        {
+            TavernLogger.Msg("Joining client sent no complete payload within the timeout");
+        }
         catch (Exception e)
         {
             TavernLogger.Error($"Error decoding TCP stream {e}");
@@ -111,7 +124,6 @@ internal class AuthManager
             client.Close();
         }
     }
-
     private async Task WritePongResponse(Stream stream)
     {
         var response = new AuthPayloads.PingResponse(
@@ -154,37 +166,71 @@ internal class AuthManager
         }
     }
 
-    private async Task PostPermissionCheck(Stream stream, AuthPayloads.AuthenticateRequest payload, string ip)
+private async Task PostPermissionCheck(Stream stream, AuthPayloads.AuthenticateRequest payload, string ip)
+{
+    await WriteResponse(stream, ResolveJoin(payload, ip));
+}
+
+// Read, decide, then write of Users.json happens under one lock, so two joiners
+// landing at the same instant can't mint the same UserId or drop each other's
+// entry. Deliberately has no awaits: the socket write happens after the lock is
+// released, so a client that never reads can't stall everyone else's join.
+private object ResolveJoin(AuthPayloads.AuthenticateRequest payload, string ip)
+{
+    lock (UsersFileLock)
     {
-        if (_manager.UserConfig.LastRead.Users.TryGetValue(payload.Username.ToLower(), out var userData))
+        // Re-read inside the lock -- another joiner may have registered between
+        // the permission checks and now
+        _manager.UserConfig.ReadFromFile();
+
+        var users = _manager.UserConfig.LastRead.Users;
+        var key = payload.Username.ToLowerInvariant();
+
+        if (users.TryGetValue(key, out var userData))
         {
-            if (string.IsNullOrWhiteSpace(userData.Token)) userData.Token = payload.Token;
+            if (string.IsNullOrWhiteSpace(userData.Token))
+            {
+                // Token was cleared by an admin -- claim it for whoever connects
+                // next under this name, so a lost token can be recovered.
+                TavernLogger.Warn($"Token re-claimed: '{payload.Username}' (ID {userData.UserId}) from {ip}");
+                userData.Token = payload.Token;
+            }
             else if (payload.Token != userData.Token)
             {
                 TavernLogger.Msg($"Joining user at IP {ip} tried to take username");
-                await WriteResponse(stream, new AuthPayloads.GenericFail("Name taken by someone else, or you lost the token to your account!"));
-                return;
+                return new AuthPayloads.GenericFail("Name taken by someone else, or you lost the token to your account!");
             }
         }
-
         else
         {
             TavernLogger.Msg($"Joining user at IP {ip} being allotted a slot in Users.json");
-            _manager.UserConfig.LastRead.Users[payload.Username.ToLower()] = new UserConfig.User
+
+            // Mint from the highest id in the file, never from the count
+            // a removed user would otherwise hand its id to the next joiner.
+            // Seeded so the first user on a fresh server still gets BaseUserID.
+
+            var nextId = users.Values
+                .Select(user => user.UserId)
+                .DefaultIfEmpty(BaseUserID - 1)
+                .Max() + 1;
+
+            userData = new UserConfig.User
             {
                 RegisteredFrom = ip,
                 Token = payload.Token,
-                UserId = 1000000000U + (ulong)_manager.UserConfig.LastRead.Users.Count
+                UserId = Math.Max(nextId, BaseUserID)
             };
 
-            userData = _manager.UserConfig.LastRead.Users[payload.Username.ToLower()];
+            users[key] = userData;
+            TavernLogger.Msg($"New player: '{payload.Username}' (ID {userData.UserId}) from {ip}");
         }
 
         TavernLogger.Msg("Writing any potential changes during join to file");
         _manager.UserConfig.WriteToFile();
-        await WriteResponse(stream, new AuthPayloads.AuthenticateOk(userData.UserId, _manager.ServerConfig.LastRead.QuestScene));
-    }
 
+        return new AuthPayloads.AuthenticateOk(userData.UserId, _manager.ServerConfig.LastRead.QuestScene);
+    }
+}
     private async Task<bool> CheckIfPermitted(string joinerIp, AuthPayloads.AuthenticateRequest payload, Stream stream)
     {
         TavernLogger.Msg($"Checking if joining user {joinerIp} can join");
@@ -192,7 +238,7 @@ internal class AuthManager
         if (_manager.UserConfig.LastRead.Whitelist.Ips.Count > 0 || _manager.UserConfig.LastRead.Whitelist.Usernames.Count > 0)
         {
             var ipAllowed = _manager.UserConfig.LastRead.Whitelist.Ips.Contains(joinerIp);
-            var nameAllowed = _manager.UserConfig.LastRead.Whitelist.Usernames.Contains(payload.Username);
+            var nameAllowed = _manager.UserConfig.LastRead.Whitelist.Usernames.Any(u => string.Equals(u, payload.Username, StringComparison.OrdinalIgnoreCase));
 
             if (!ipAllowed && !nameAllowed)
             {
@@ -270,21 +316,26 @@ internal class AuthManager
             var joinerIp = ((IPEndPoint)joiner.Client.RemoteEndPoint).Address.ToString();
             TavernLogger.Msg($"Whitelist application from {username} at {joinerIp}");
 
-            _manager.WhitelistRequests.ReadFromFile(); // pick up anything the owner's panel already cleared
-            var requests = _manager.WhitelistRequests.LastRead.Requests;
+            bool alreadyPending;
 
-            var alreadyPending = requests.Exists(r =>
-                string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase) && r.Ip == joinerIp);
-
-            if (!alreadyPending)
+            lock (WhitelistRequestsFileLock)
             {
-                requests.Add(new WhitelistRequestList.WhitelistRequest
+                _manager.WhitelistRequests.ReadFromFile(); // pick up anything the owner's panel already cleared
+                var requests = _manager.WhitelistRequests.LastRead.Requests;
+
+                alreadyPending = requests.Exists(r =>
+                    string.Equals(r.Username, username, StringComparison.OrdinalIgnoreCase) && r.Ip == joinerIp);
+
+                if (!alreadyPending)
                 {
-                    Username = username,
-                    Ip = joinerIp,
-                    AppliedAt = DateTime.UtcNow.ToString("o"),
-                });
-                _manager.WhitelistRequests.WriteToFile();
+                    requests.Add(new WhitelistRequestList.WhitelistRequest
+                    {
+                        Username = username,
+                        Ip = joinerIp,
+                        AppliedAt = DateTime.UtcNow.ToString("o"),
+                    });
+                    _manager.WhitelistRequests.WriteToFile();
+                }
             }
 
             await WriteResponse(stream, new AuthPayloads.WhitelistApplicationReceived(!alreadyPending));
