@@ -19,7 +19,7 @@ public abstract class ServerConfigFile<T>(string filePath) where T : class, new(
                 LastRead = new T();
                     
                 using var stream = File.CreateText(FilePath);
-                stream.WriteAsync(JsonConvert.SerializeObject(LastRead, Formatting.Indented));
+                stream.Write(JsonConvert.SerializeObject(LastRead, Formatting.Indented));
                     
                 return;
             }
@@ -30,7 +30,7 @@ public abstract class ServerConfigFile<T>(string filePath) where T : class, new(
         }
         catch (Exception e)
         {
-            TavernLogger.Error($"Error when managing file responsible for type {nameof(T)}! {e}");
+            TavernLogger.Error($"Error when managing file responsible for type {typeof(T).Name}! {e}");
             throw;
         }
     }
@@ -44,7 +44,7 @@ public abstract class ServerConfigFile<T>(string filePath) where T : class, new(
                 LastRead ??= new T();
                     
                 using var stream = File.CreateText(FilePath);
-                stream.WriteAsync(JsonConvert.SerializeObject(LastRead, Formatting.Indented));
+                stream.Write(JsonConvert.SerializeObject(LastRead, Formatting.Indented));
                     
                 return;
             }
@@ -53,7 +53,7 @@ public abstract class ServerConfigFile<T>(string filePath) where T : class, new(
         }
         catch (Exception e)
         {
-            TavernLogger.Error($"Error when managing file responsible for type {nameof(T)}! {e}");
+            TavernLogger.Error($"Error when managing file responsible for type {typeof(T).Name}! {e}");
             throw;
         }
     }
