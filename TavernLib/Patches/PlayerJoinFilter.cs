@@ -41,41 +41,51 @@ public static class PlayerJoinFilter
         {
             TavernLogger.Error($"Error when filtering join request! {e}");
             await ServerPlayerConnectionHandlerOld.PlayerDenied(connection, "Error when checking authenticity");
-            throw;
         }
     }
 
-    private static async Task<bool> FilterInvalidTokens(Connection connection, Stream stream)
+private static async Task<bool> FilterInvalidTokens(Connection connection, Stream stream)
+{
+    try
     {
-        try
+        using var readingStream = stream.Clone() as Stream;
+        var requestJoinMessage = new RequestJoinMessage();
+        requestJoinMessage.Serialize(connection, readingStream);
+
+        TavernLogger.Msg($"User trying to join with JWT {requestJoinMessage.UserCredentials}");
+
+        var token = JWTUtility.CreateFromString(requestJoinMessage.UserCredentials, true);
+        var tavernToken = token.Claims.FirstOrDefault(claim => claim.Type == "TavernToken")?.Value;
+
+        var idClaim = token.Claims.FirstOrDefault(claim => claim.Type == "UserId")?.Value;
+        if (!ulong.TryParse(idClaim, out var id))
         {
-            using var readingStream = stream.Clone() as Stream;
-            var requestJoinMessage = new RequestJoinMessage();
-            requestJoinMessage.Serialize(connection, readingStream);
-
-            TavernLogger.Msg($"User trying to join with JWT {requestJoinMessage.UserCredentials}");
-
-            var token = JWTUtility.CreateFromString(requestJoinMessage.UserCredentials, true);
-            var tavernToken = token.Claims.FirstOrDefault(claim => claim.Type == "TavernToken")?.Value;
-            var id = ulong.Parse(token.Claims.FirstOrDefault(claim => claim.Type == "UserId")?.Value ?? "0");
-            var username = token.Claims.FirstOrDefault(claim => claim.Type == "Username")?.Value ?? "";
-
-            var userConfig = TavernServices.GetService<TavernManager>().UserConfig;
-            userConfig.ReadFromFile();
-            var users = userConfig.LastRead.Users;
-            if (users.TryGetValue(username.ToLowerInvariant(), out var user) && user.UserId == id && !string.IsNullOrEmpty(user.Token) && user.Token == tavernToken) return true;
-
+            TavernLogger.Warn($"Join denied: unparseable UserId claim '{idClaim}' from {connection.IpAddress}");
             await ServerPlayerConnectionHandlerOld.PlayerDenied(connection, "Data mismatch or account not found");
             return false;
         }
 
-        catch (Exception e)
-        {
-            TavernLogger.Error($"Error in FilterInvalidTokens! {e}");
-            throw;
-        }
-    }
+        var username = token.Claims.FirstOrDefault(claim => claim.Type == "Username")?.Value ?? "";
 
+        var userConfig = TavernServices.GetService<TavernManager>().UserConfig;
+        userConfig.ReadFromFile();
+        var users = userConfig.LastRead.Users;
+
+        if (users.TryGetValue(username.ToLowerInvariant(), out var user) &&
+            user.UserId == id &&
+            !string.IsNullOrEmpty(user.Token) &&
+            user.Token == tavernToken)
+            return true;
+
+        await ServerPlayerConnectionHandlerOld.PlayerDenied(connection, "Data mismatch or account not found");
+        return false;
+    }
+    catch (Exception e)
+    {
+        TavernLogger.Error($"Error in FilterInvalidTokens! {e}");
+        throw;
+    }
+}
     private static async Task<bool> FilterFlyCam(Connection connection, Stream stream)
     {
         try
